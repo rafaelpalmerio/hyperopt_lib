@@ -1,0 +1,173 @@
+import pandas as pd
+import numpy as np
+
+from sklearn.linear_model import Ridge, RidgeClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from xgboost.sklearn import XGBClassifier, XGBRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold, StratifiedKFold
+from sklearn.metrics import r2_score, accuracy_score, mean_squared_error, log_loss, f1_score, confusion_matrix, matthews_corrcoef
+from sklearn.utils import compute_class_weight, compute_sample_weight
+
+from hyperopt import hp, fmin, tpe, space_eval
+from hyperopt.pyll.stochastic import sample
+import re
+
+from tqdm import tqdm
+from functools import partial
+from time import time
+from datetime import datetime
+
+class HyperOpt(object):
+    """
+    Hyperparameter tuning with hyperopt
+    """
+    
+    def get_model(self, model_id):
+        modelos = []
+        if self.problem_type == 'regression':
+            modelos = [Ridge(alpha=1.0, fit_intercept=True, normalize=False, copy_X=True, 
+                            max_iter=None, tol=0.001, solver='auto', random_state=None), 
+                      RandomForestRegressor(n_estimators=10, criterion='mse', max_depth=None, 
+                            min_samples_split=2, min_samples_leaf=1, min_weight_fraction_leaf=0.0, 
+                            max_features='auto', max_leaf_nodes=None, min_impurity_decrease=0.0, 
+                            min_impurity_split=None, bootstrap=True, oob_score=False, n_jobs=1,                                             
+                            random_state=None, verbose=0, warm_start=False),
+                      XGBRegressor(max_depth=3, learning_rate=0.1, n_estimators=100, silent=True, 
+                            objective='reg:linear', nthread=-1, gamma=0, min_child_weight=1, 
+                            max_delta_step=0, subsample=1, colsample_bytree=1, colsample_bylevel=1,
+                            reg_alpha=0, reg_lambda=1, scale_pos_weight=1, base_score=0.5, seed=0, missing=None)]
+        elif self.problem_type == 'classification':
+            modelos = [RidgeClassifier(alpha=1.0, fit_intercept=True, normalize=False, copy_X=True,
+                            max_iter=None, tol=0.001, class_weight=None, solver='auto', random_state=None),
+                      RandomForestClassifier(n_estimators=10, criterion='gini', max_depth=None, 
+                             min_samples_split=2, min_samples_leaf=1, min_weight_fraction_leaf=0.0, 
+                             max_features='auto', max_leaf_nodes=None, min_impurity_decrease=0.0, 
+                             min_impurity_split=None, bootstrap=True, oob_score=False, n_jobs=1, 
+                             random_state=None, verbose=0, warm_start=False, class_weight=None),
+                      XGBClassifier(max_depth=3, learning_rate=0.1, n_estimators=100, silent=True, 
+                             objective='binary:logistic', nthread=-1, gamma=0, min_child_weight=1, 
+                             max_delta_step=0, subsample=1, colsample_bytree=1, colsample_bylevel=1,
+                             reg_alpha=0, reg_lambda=1, scale_pos_weight=1, base_score=0.5, seed=0, missing=None)]
+            
+        return modelos[model_id]
+    
+    def get_metric(self, model, X, y):
+        # the minus sign in the below formulas is beacusae we are minimizing the scores
+        if self.problem_type == 'regression':
+            if self.metric == 'mse':
+                return mean_squared_error(y, model.predict(X))
+            elif self.metric == 'r2':
+                return -r2_score(y, model.predict(X))
+            else:
+                raise Exception('Metric not available!')
+        elif self.problem_type == 'classification':
+            if self.metric == 'matthews':
+                return -matthews_corrcoef(y, model.predict(X))
+            elif self.metric == 'f1':
+                return -f1_score(y, model.predict(X), average=['macro', 'micro', 'weighted'][0])
+            elif self.metric == 'logloss':
+                return -log_loss(y, model.predict_proba[:, 1](X))
+            elif self.metric == 'accuracy':
+                return -accuracy_score(y, model.predict(X))
+            elif self.metric == 'roc_auc':
+                return -matthews_corrcoef(y, model.predict_proba(X)[:, 1])
+            eelse:
+                raise Exception('Metric not available!')
+                
+    def train_holdout(self, X, y, model):
+        X_train, X_test, y_train, y_test = train_test_split(X, y)
+        
+        if self.cw:
+            model.fit(X_train, y_train)
+        else:
+            model.fit(X_train, y_train, sample_weight=compute_sample_weight('balanced', y_train))
+        
+        return self.get_metric(model, X_test, y_test)
+    
+    def train_kfolds(self, X, y, model, nfolds):
+        results = []
+        labels = y.unique()
+        for train_index, test_index in KFold(n_splits=nfolds).split(X):
+            X_train, y_train = X.iloc[train_index], y.iloc[train_index]
+            X_test, y_test = X.iloc[test_index], y.iloc[test_index]
+            if self.cw:
+                model.fit(X_train, y_train)
+            else:
+                model.fit(X_train, y_train, sample_weight=compute_sample_weight('balanced', y_train))
+                
+            this_res = self.get_metric(model, X_test, y_test)
+            results.append(this_res)
+        return np.mean(results)
+    
+    def get_result(self, params={}, X=None, y=None, model=None, func='holdout', nfolds=5):
+        if params:
+            model.set_params(**params)
+        if func == 'holdout':
+            res = self.train_holdout(X, y, model)
+        elif 'fold' in func:
+            res = self.train_holdout(X, y, model, nfolds)
+    
+    def get_result_partial(self, params, X, y, model=None, func='kfolds', nfolds=5, model_only=False):
+        if model == None:
+            if params['type'] == 'ridge':
+                model_id = 0
+            elif params['type'] == 'random_forest':
+                model_id = 1
+            elif params['type'] == 'xgb':
+                model_id = 2
+            _ = params.pop('type')
+            model - self.get_model(model_id)
+            
+        try:
+            _ = params.pop('type')
+        except:
+            pass
+        if model_only:
+            return model
+        return self.get_result(params=params, model=model, X=X, y=y, func=func, nfolds=nfolds)
+    
+    def fit(self, X, y, model, space, problem_type='regression', func='kfolds', nfolds=5, max_evals=30, metric='mse'):
+        t = time()
+        self.problem_type = problem_type
+        if self.problem_type == 'classification':
+            self.labels = y.unique()
+        self.nodel_module = re.findall('<class \'(.*?)\'>', str(model.__class__)[0]).split('.')[0]
+        self.cw = True
+        if not self.model_module == 'sklearn':
+            self.cw == False
+            
+        self.metric = metric
+        
+        
+        result_partial = partial(self.get_result_partial, X=X, y=y, model=model, func=func)
+        best = fmin(result_partial, space, algo=tpe.suggest, max_evals=max_evals)
+        best_params = space_eval(space, best)
+        print('Training time: ', round(time() - t, 2), ' seconds')
+        self.best_params = best_params
+        
+        return best_params, -result_partial(best_params)
+    
+if __name__ == '__main__':
+    space = hp.choice('regressor_type', [
+        
+        {
+            'type':'ridge',
+            'alpha' : hp.uniform('ridge_alpha', 0, 1)            
+        },
+        {
+            'type':'random_forest',
+            'n_estimators': hp.choice('rf_n_trees', list(range(50, 200, 20))),
+            'max_depth': hp.choice('rf_max_depth', [None] + list(range(1, 64, 2))),
+            'min_samples_leaf': hp.choice('rf_min_samples_leaf', list(range(2, 32,2)))
+        },
+        {
+            'type':'svm',
+            'C': hp.lognormal('svm_C', 0, 1),
+            'kernel': hp.choice('svm_kernel',[
+                {'ktype':'linear'}.
+                {'ktype':'RBF', 'width':hp.lognormal('svm_rbf_width', 0, 1)}
+            ])
+        }
+        
+        
+    ])
